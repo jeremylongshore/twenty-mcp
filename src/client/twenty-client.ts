@@ -17,16 +17,21 @@ import {
 
 export class TwentyClient {
   private client: GraphQLClient;
+  // Twenty exposes two separate GraphQL endpoints: /graphql (data: companies,
+  // people, opportunities, ...) and /metadata (object/field schema
+  // introspection). Metadata queries 404/type-error against /graphql — they
+  // must go through this second client. See jezweb/twenty-mcp#35.
+  private metadataClient: GraphQLClient;
   private baseUrl: string;
 
   constructor(config: TwentyConfig) {
     this.baseUrl = config.baseUrl || 'https://api.twenty.com';
-    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, {
-      headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
+    const headers = {
+      'Authorization': `Bearer ${config.apiKey}`,
+      'Content-Type': 'application/json',
+    };
+    this.client = new GraphQLClient(`${this.baseUrl}/graphql`, { headers });
+    this.metadataClient = new GraphQLClient(`${this.baseUrl}/metadata`, { headers });
   }
 
   async createPerson(person: Person): Promise<Person> {
@@ -99,7 +104,7 @@ export class TwentyClient {
 
   async updatePerson(id: string, updates: Partial<Person>): Promise<Person> {
     const mutation = `
-      mutation UpdatePerson($id: ID!, $data: PersonUpdateInput!) {
+      mutation UpdatePerson($id: UUID!, $data: PersonUpdateInput!) {
         updatePerson(id: $id, data: $data) {
           id
           name {
@@ -261,7 +266,7 @@ export class TwentyClient {
 
   async updateCompany(id: string, updates: Partial<Company>): Promise<Company> {
     const mutation = `
-      mutation UpdateCompany($id: ID!, $data: CompanyUpdateInput!) {
+      mutation UpdateCompany($id: UUID!, $data: CompanyUpdateInput!) {
         updateCompany(id: $id, data: $data) {
           id
           name
@@ -353,12 +358,20 @@ export class TwentyClient {
   }
 
   async createTask(task: Task): Promise<Task> {
+    // Twenty v2 schema: body (String) → bodyV2 (RichTextCreateInput { markdown }).
+    // Keep the external interface flat; translate at the boundary.
+    const { body, ...rest } = task;
+    const data: Record<string, unknown> = { ...rest };
+    if (body !== undefined) {
+      data.bodyV2 = { markdown: body };
+    }
+
     const mutation = `
       mutation CreateTask($data: TaskCreateInput!) {
         createTask(data: $data) {
           id
           title
-          body
+          bodyV2 { markdown }
           dueAt
           status
           assigneeId
@@ -366,8 +379,11 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(mutation, { data: task }) as { createTask: Task };
-    return result.createTask;
+    const result = await this.client.request(mutation, { data }) as {
+      createTask: Omit<Task, 'body'> & { bodyV2?: { markdown?: string } | null };
+    };
+    const { bodyV2, ...task_out } = result.createTask;
+    return { ...task_out, body: bodyV2?.markdown ?? undefined } as Task;
   }
 
   async getTasks(options: SearchOptions = {}): Promise<Task[]> {
@@ -378,7 +394,7 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 { markdown }
               status
             }
           }
@@ -386,25 +402,46 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { tasks: { edges: { node: Task }[] } };
+    const result = await this.client.request(query) as {
+      tasks: { edges: { node: Omit<Task, 'body'> & { bodyV2?: { markdown?: string } | null } }[] };
+    };
 
-    return result.tasks.edges.map(edge => edge.node);
+    return result.tasks.edges.map(edge => {
+      const { bodyV2, ...node } = edge.node;
+      return { ...node, body: bodyV2?.markdown ?? undefined } as Task;
+    });
   }
 
   async createNote(note: Note): Promise<Note> {
+    // Twenty v2 schema: body (String) → bodyV2 (RichTextCreateInput { markdown }).
+    // authorId is no longer on NoteCreateInput; createdBy is an ActorCreateInput
+    // we don't synthesize here (server stamps from API key context).
+    const { body, authorId, ...rest } = note;
+    const data: Record<string, unknown> = {
+      ...rest,
+      bodyV2: { markdown: body },
+    };
+
     const mutation = `
       mutation CreateNote($data: NoteCreateInput!) {
         createNote(data: $data) {
           id
           title
-          body
-          authorId
+          bodyV2 { markdown }
         }
       }
     `;
 
-    const result = await this.client.request(mutation, { data: note }) as { createNote: Note };
-    return result.createNote;
+    const result = await this.client.request(mutation, { data }) as {
+      createNote: { id: string; title?: string; bodyV2?: { markdown?: string } | null };
+    };
+    const created = result.createNote;
+    return {
+      id: created.id,
+      title: created.title,
+      body: created.bodyV2?.markdown ?? '',
+      authorId,
+    } as Note;
   }
 
   async createOpportunity(opportunity: CreateOpportunityInput): Promise<Opportunity> {
@@ -462,7 +499,7 @@ export class TwentyClient {
   async updateOpportunity(input: UpdateOpportunityInput): Promise<Opportunity> {
     const { id, ...data } = input;
     const mutation = `
-      mutation UpdateOpportunity($id: ID!, $data: OpportunityUpdateInput!) {
+      mutation UpdateOpportunity($id: UUID!, $data: OpportunityUpdateInput!) {
         updateOpportunity(id: $id, data: $data) {
           id
           name
@@ -486,8 +523,8 @@ export class TwentyClient {
 
   async searchOpportunities(input: SearchOpportunitiesInput): Promise<Opportunity[]> {
     const query = `
-      query SearchOpportunities($filter: OpportunityFilterInput, $first: Int, $skip: Int) {
-        opportunities(filter: $filter, first: $first, skip: $skip) {
+      query SearchOpportunities($filter: OpportunityFilterInput, $first: Int) {
+        opportunities(filter: $filter, first: $first) {
           edges {
             node {
               id
@@ -534,10 +571,11 @@ export class TwentyClient {
       if (input.maxAmount) filters.amount.amountMicros.lte = input.maxAmount * 1000000;
     }
 
+    // Twenty uses cursor pagination (first/after), not offset — `input.offset`
+    // has no server-side equivalent here and is intentionally not sent.
     const result = await this.client.request(query, {
       filter: Object.keys(filters).length > 0 ? filters : undefined,
       first: input.limit || 20,
-      skip: input.offset || 0,
     }) as { opportunities: { edges: { node: Opportunity }[] } };
 
     return result.opportunities.edges.map(edge => edge.node);
@@ -592,7 +630,7 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 { markdown }
               status
               dueAt
               assigneeId
@@ -618,7 +656,7 @@ export class TwentyClient {
             node {
               id
               title
-              body
+              bodyV2 { markdown }
               createdAt
               updatedAt
             }
@@ -646,7 +684,7 @@ export class TwentyClient {
         id: task.id,
         type: 'task',
         title: task.title,
-        body: task.body,
+        body: task.bodyV2?.markdown,
         createdAt: task.createdAt,
         updatedAt: task.updatedAt,
         authorId: task.assigneeId,
@@ -660,7 +698,7 @@ export class TwentyClient {
         id: note.id,
         type: 'note',
         title: note.title,
-        body: note.body,
+        body: note.bodyV2?.markdown,
         createdAt: note.createdAt,
         updatedAt: note.updatedAt,
         authorId: undefined,
@@ -707,46 +745,174 @@ export class TwentyClient {
   }
 
   async createComment(input: CreateCommentInput): Promise<Comment> {
-    const mutation = `
-      mutation CreateComment($data: CommentCreateInput!) {
-        createComment(data: $data) {
+    // Twenty v2 schema removed the standalone Comment model. Comments on
+    // CRM records are now Notes with a NoteTarget linking the Note to a
+    // company / person / opportunity. We preserve the external interface
+    // (body + targetObjectId/Type) and translate at the boundary.
+    //
+    // Two-step:
+    //   1. createNote with bodyV2.markdown
+    //   2. createNoteTarget linking the new noteId to the target
+
+    const createNoteMutation = `
+      mutation CreateNote($data: NoteCreateInput!) {
+        createNote(data: $data) {
           id
-          body
-          authorId
-          author {
-            id
-            name {
-              firstName
-              lastName
-            }
-          }
           createdAt
           updatedAt
+          bodyV2 { markdown }
+        }
+      }
+    `;
+    const noteResult = await this.client.request(createNoteMutation, {
+      data: { bodyV2: { markdown: input.body } },
+    }) as { createNote: { id: string; createdAt: string; updatedAt: string; bodyV2?: { markdown?: string } | null } };
+    const note = noteResult.createNote;
+
+    const targetType = input.targetObjectNameSingular;
+    const targetId = input.targetObjectId;
+    if (targetType && targetId) {
+      const targetFieldByType: Record<string, string> = {
+        company: 'targetCompanyId',
+        person: 'targetPersonId',
+        opportunity: 'targetOpportunityId',
+      };
+      const targetField = targetFieldByType[targetType];
+      if (!targetField) {
+        throw new Error(
+          `Unsupported targetObjectType for comment: "${targetType}" — expected one of: company, person, opportunity.`
+        );
+      }
+      const createNoteTargetMutation = `
+        mutation CreateNoteTarget($data: NoteTargetCreateInput!) {
+          createNoteTarget(data: $data) {
+            id
+          }
+        }
+      `;
+      await this.client.request(createNoteTargetMutation, {
+        data: { noteId: note.id, [targetField]: targetId },
+      });
+    }
+
+    return {
+      id: note.id,
+      body: note.bodyV2?.markdown ?? input.body,
+      createdAt: note.createdAt,
+      updatedAt: note.updatedAt,
+      authorId: input.authorId,
+      activityTargetId: input.activityTargetId,
+    } as Comment;
+  }
+
+  async getEntityActivities(input: EntityActivitiesInput): Promise<ActivityTimeline> {
+    // Notes/Tasks link to a company/person/opportunity via NoteTarget/TaskTarget
+    // join records (same shape createComment() uses). Query those directly
+    // instead of fetching all activities and filtering client-side.
+    const targetFieldByType: Record<string, string> = {
+      company: 'targetCompanyId',
+      person: 'targetPersonId',
+      opportunity: 'targetOpportunityId',
+    };
+    const targetField = targetFieldByType[input.entityType];
+    if (!targetField) {
+      throw new Error(
+        `Unsupported entityType for getEntityActivities: "${input.entityType}" — expected one of: company, person, opportunity.`
+      );
+    }
+
+    const limit = input.limit || 20;
+
+    const noteTargetsQuery = `
+      query GetEntityNoteTargets($filter: NoteTargetFilterInput, $first: Int) {
+        noteTargets(filter: $filter, first: $first) {
+          edges {
+            node {
+              note {
+                id
+                title
+                bodyV2 { markdown }
+                createdAt
+                updatedAt
+              }
+            }
+          }
         }
       }
     `;
 
-    const commentData = {
-      body: input.body,
-      ...(input.authorId && { authorId: input.authorId }),
-      ...(input.activityTargetId && { activityTargetId: input.activityTargetId })
-    };
+    const taskTargetsQuery = `
+      query GetEntityTaskTargets($filter: TaskTargetFilterInput, $first: Int) {
+        taskTargets(filter: $filter, first: $first) {
+          edges {
+            node {
+              task {
+                id
+                title
+                bodyV2 { markdown }
+                status
+                dueAt
+                assigneeId
+                assignee {
+                  id
+                  name { firstName lastName }
+                }
+                createdAt
+                updatedAt
+              }
+            }
+          }
+        }
+      }
+    `;
 
-    const result = await this.client.request(mutation, { data: commentData }) as { createComment: Comment };
-    return result.createComment;
-  }
+    const filter = { [targetField]: { eq: input.entityId } };
 
-  async getEntityActivities(input: EntityActivitiesInput): Promise<ActivityTimeline> {
-    // For now, we'll get general activities and filter client-side
-    // In a real implementation, you'd want to use the entity relationships in the GraphQL query
-    const activities = await this.getActivities({
-      limit: input.limit,
-      offset: input.offset
+    const [noteTargetsResult, taskTargetsResult] = await Promise.all([
+      this.client.request(noteTargetsQuery, { filter, first: limit }),
+      this.client.request(taskTargetsQuery, { filter, first: limit }),
+    ]);
+
+    const typedNoteTargets = noteTargetsResult as { noteTargets: { edges: { node: { note: any } }[] } };
+    const typedTaskTargets = taskTargetsResult as { taskTargets: { edges: { node: { task: any } }[] } };
+
+    const activities: Activity[] = [];
+
+    typedNoteTargets.noteTargets.edges.forEach(edge => {
+      const note = edge.node.note;
+      activities.push({
+        id: note.id,
+        type: 'note',
+        title: note.title,
+        body: note.bodyV2?.markdown,
+        createdAt: note.createdAt,
+        updatedAt: note.updatedAt,
+        authorId: undefined,
+        author: undefined,
+      });
     });
 
-    // Note: This is a simplified implementation. In practice, you'd want to query
-    // activities that are specifically related to the entity through proper GraphQL relationships
-    return activities;
+    typedTaskTargets.taskTargets.edges.forEach(edge => {
+      const task = edge.node.task;
+      activities.push({
+        id: task.id,
+        type: 'task',
+        title: task.title,
+        body: task.bodyV2?.markdown,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        authorId: task.assigneeId,
+        author: task.assignee,
+      });
+    });
+
+    activities.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    return {
+      activities,
+      totalCount: activities.length,
+      hasMore: activities.length === limit * 2,
+    };
   }
 
   async listAllObjects(options: MetadataQueryOptions = {}): Promise<ObjectSummary> {
@@ -773,7 +939,7 @@ export class TwentyClient {
       }
     `;
 
-    const result = await this.client.request(query) as { objects: { edges: { node: ObjectMetadata }[] } };
+    const result = await this.metadataClient.request(query) as { objects: { edges: { node: ObjectMetadata }[] } };
     const allObjects = result.objects.edges.map(edge => edge.node);
 
     // Filter based on options
@@ -808,71 +974,93 @@ export class TwentyClient {
   }
 
   async getObjectSchema(objectNameOrId: string): Promise<ObjectSchema> {
-    const objectQuery = `
-      query GetObjectSchema($filter: ObjectFilterInput!) {
-        objects(filter: $filter) {
-          edges {
-            node {
-              id
-              nameSingular
-              namePlural
-              labelSingular
-              labelPlural
-              description
-              icon
-              isCustom
-              isActive
-              isSystem
-              createdAt
-              updatedAt
-              fields {
-                edges {
-                  node {
-                    id
-                    name
-                    label
-                    description
-                    type
-                    isCustom
-                    isActive
-                    isNullable
-                    isSystem
-                    defaultValue
-                    createdAt
-                    updatedAt
-                  }
-                }
+    // ObjectFilter (the /metadata endpoint's filter input) only exposes
+    // id/isCustom/isActive/isRemote/isSystem/isUIReadOnly/isSearchable —
+    // there is no nameSingular/namePlural filter field. A UUID can filter
+    // server-side by id; a name has to fetch (the small, unpaginated) full
+    // object list and match client-side. See jezweb/twenty-mcp#35.
+    const isUuid = objectNameOrId.match(/^[0-9a-fA-F-]{36}$/);
+
+    const fieldsSelection = `
+      id
+      name
+      label
+      description
+      type
+      isCustom
+      isActive
+      isNullable
+      isSystem
+      defaultValue
+      createdAt
+      updatedAt
+    `;
+
+    const objectQuery = isUuid
+      ? `
+        query GetObjectSchemaById($filter: ObjectFilter!) {
+          objects(filter: $filter) {
+            edges {
+              node {
+                id
+                nameSingular
+                namePlural
+                labelSingular
+                labelPlural
+                description
+                icon
+                isCustom
+                isActive
+                isSystem
+                createdAt
+                updatedAt
+                fields { edges { node { ${fieldsSelection} } } }
               }
             }
           }
         }
-      }
-    `;
-
-    // Try to find object by name first, then by ID
-    let filter;
-    if (objectNameOrId.match(/^[0-9a-fA-F-]{36}$/)) {
-      // Looks like a UUID
-      filter = { id: { eq: objectNameOrId } };
-    } else {
-      // Assume it's a name
-      filter = { 
-        or: [
-          { nameSingular: { eq: objectNameOrId } },
-          { namePlural: { eq: objectNameOrId } }
-        ]
-      };
-    }
-
-    const result = await this.client.request(objectQuery, { filter }) as { 
-      objects: { 
-        edges: { 
-          node: ObjectMetadata & { 
-            fields: { edges: { node: FieldMetadata }[] } 
+      `
+      : `
+        query GetAllObjectSchemas {
+          objects {
+            edges {
+              node {
+                id
+                nameSingular
+                namePlural
+                labelSingular
+                labelPlural
+                description
+                icon
+                isCustom
+                isActive
+                isSystem
+                createdAt
+                updatedAt
+                fields { edges { node { ${fieldsSelection} } } }
+              }
+            }
           }
-        }[] 
-      } 
+        }
+      `;
+
+    const variables = isUuid ? { filter: { id: { eq: objectNameOrId } } } : {};
+
+    const result = await this.metadataClient.request(objectQuery, variables) as {
+      objects: {
+        edges: {
+          node: ObjectMetadata & {
+            fields: { edges: { node: FieldMetadata }[] }
+          }
+        }[]
+      }
     };
+
+    if (!isUuid) {
+      result.objects.edges = result.objects.edges.filter(
+        edge => edge.node.nameSingular === objectNameOrId || edge.node.namePlural === objectNameOrId
+      );
+    }
 
     if (result.objects.edges.length === 0) {
       throw new Error(`Object not found: ${objectNameOrId}`);
@@ -907,45 +1095,42 @@ export class TwentyClient {
     let variables: any = {};
 
     if (options.objectId || options.objectName) {
-      // Get fields for a specific object
-      query = `
-        query GetFieldsForObject($filter: ObjectFilterInput!) {
-          objects(filter: $filter) {
-            edges {
-              node {
-                fields {
-                  edges {
-                    node {
-                      id
-                      name
-                      label
-                      description
-                      type
-                      isCustom
-                      isActive
-                      isNullable
-                      isSystem
-                      defaultValue
-                      createdAt
-                      updatedAt
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+      // ObjectFilter has no name field (only id/isCustom/isActive/isRemote/
+      // isSystem/isUIReadOnly/isSearchable) — a name lookup fetches all
+      // objects (small, unpaginated list) and matches client-side; an id
+      // lookup filters server-side. See jezweb/twenty-mcp#35.
+      const fieldSelection = `
+        id
+        name
+        label
+        description
+        type
+        isCustom
+        isActive
+        isNullable
+        isSystem
+        defaultValue
+        createdAt
+        updatedAt
       `;
 
       if (options.objectId) {
+        query = `
+          query GetFieldsForObjectById($filter: ObjectFilter!) {
+            objects(filter: $filter) {
+              edges { node { nameSingular namePlural fields { edges { node { ${fieldSelection} } } } } }
+            }
+          }
+        `;
         variables.filter = { id: { eq: options.objectId } };
       } else {
-        variables.filter = { 
-          or: [
-            { nameSingular: { eq: options.objectName } },
-            { namePlural: { eq: options.objectName } }
-          ]
-        };
+        query = `
+          query GetFieldsForAllObjects {
+            objects {
+              edges { node { nameSingular namePlural fields { edges { node { ${fieldSelection} } } } } }
+            }
+          }
+        `;
       }
     } else {
       // Get all fields across all objects
@@ -973,15 +1158,21 @@ export class TwentyClient {
       `;
     }
 
-    const result = await this.client.request(query, variables) as any;
-    
+    const result = await this.metadataClient.request(query, variables) as any;
+
     let fields: FieldMetadata[];
-    
+
     if (options.objectId || options.objectName) {
-      if (result.objects.edges.length === 0) {
+      let objectEdges = result.objects.edges;
+      if (options.objectName) {
+        objectEdges = objectEdges.filter((edge: any) =>
+          edge.node.nameSingular === options.objectName || edge.node.namePlural === options.objectName
+        );
+      }
+      if (objectEdges.length === 0) {
         throw new Error(`Object not found: ${options.objectId || options.objectName}`);
       }
-      fields = result.objects.edges[0].node.fields.edges.map((edge: any) => edge.node);
+      fields = objectEdges[0].node.fields.edges.map((edge: any) => edge.node);
     } else {
       fields = result.fields.edges.map((edge: any) => edge.node);
     }
@@ -1012,7 +1203,7 @@ export class TwentyClient {
 
   async getCompanyContacts(companyId: string): Promise<CompanyContactsResult> {
     const query = `
-      query GetCompanyContacts($companyId: String!) {
+      query GetCompanyContacts($companyId: UUID!) {
         company(filter: { id: { eq: $companyId } }) {
           id
           name
@@ -1060,7 +1251,7 @@ export class TwentyClient {
 
   async getPersonOpportunities(personId: string): Promise<PersonOpportunitiesResult> {
     const query = `
-      query GetPersonOpportunities($personId: String!) {
+      query GetPersonOpportunities($personId: UUID!) {
         person(filter: { id: { eq: $personId } }) {
           id
           name {
@@ -1106,7 +1297,7 @@ export class TwentyClient {
 
   async linkOpportunityToCompany(input: LinkOpportunityInput): Promise<any> {
     const mutation = `
-      mutation LinkOpportunity($id: String!, $data: OpportunityUpdateInput!) {
+      mutation LinkOpportunity($id: UUID!, $data: OpportunityUpdateInput!) {
         updateOpportunity(id: $id, data: $data) {
           id
           name
@@ -1141,7 +1332,7 @@ export class TwentyClient {
 
   async transferContactToCompany(input: TransferContactInput): Promise<any> {
     const mutation = `
-      mutation TransferContact($id: String!, $data: PersonUpdateInput!) {
+      mutation TransferContact($id: UUID!, $data: PersonUpdateInput!) {
         updatePerson(id: $id, data: $data) {
           id
           name {
@@ -1250,7 +1441,7 @@ export class TwentyClient {
       // Find contacts without companies
       const contactsQuery = `
         query GetContactsWithoutCompanies {
-          people(filter: { companyId: { is: "NULL" } }, first: 1000) {
+          people(filter: { companyId: { is: NULL } }, first: 1000) {
             edges {
               node {
                 id
