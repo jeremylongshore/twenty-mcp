@@ -17,3 +17,5 @@ test-results/*
 .smithery/deploy/
 .smithery/*.log
 !.smithery/config.json
+# Local pnpm installs; this fork tracks package-lock.json (npm)
+pnpm-lock.yaml
